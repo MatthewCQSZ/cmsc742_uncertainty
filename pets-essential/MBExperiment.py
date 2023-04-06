@@ -12,6 +12,8 @@ from tqdm import trange
 from Agent import Agent
 from DotmapUtils import get_required_argument
 
+from torch.utils.tensorboard import SummaryWriter
+
 
 class MBExperiment:
     def __init__(self, params):
@@ -59,10 +61,12 @@ class MBExperiment:
 
         self.logdir = os.path.join(
             get_required_argument(params.log_cfg, "logdir", "Must provide log parent directory."),
-            strftime("%Y-%m-%d--%H:%M:%S", localtime())
+            strftime("%Y-%m-%d--%H:%M:%S", localtime()) + str(params.sim_cfg.env),
+            
         )
         self.nrecord = params.log_cfg.get("nrecord", 0)
         self.neval = params.log_cfg.get("neval", 1)
+        self.writer = SummaryWriter(self.logdir)
 
     def run_experiment(self):
         """Perform experiment.
@@ -113,16 +117,25 @@ class MBExperiment:
             traj_rews.extend([sample["rewards"] for sample in samples[:self.nrollouts_per_iter]])
             samples = samples[:self.nrollouts_per_iter]
 
-            self.policy.dump_logs(self.logdir, iter_dir)
-            savemat(
-                os.path.join(self.logdir, "logs.mat"),
-                {
-                    "observations": traj_obs,
-                    "actions": traj_acs,
-                    "returns": traj_rets,
-                    "rewards": traj_rews
-                }
-            )
+            #old logging, we changed to tensorboard
+            #self.policy.dump_logs(self.logdir, iter_dir)
+            #savemat(
+            #    os.path.join(self.logdir, "logs.mat"),
+                #{
+            #        "observations": traj_obs,
+            #        "actions": traj_acs,
+            #        "returns": traj_rets,
+            #        "rewards": traj_rews
+            #    }
+            #)
+
+            #per eval iter logging
+            sum_return = 0
+            for j in range(len(samples)):
+                sum_return += samples[j]["reward_sum"]
+            mean_return = sum_return / len(samples)
+            self.writer.add_scalar("mean eval return vs train iter", mean_return, i)
+
             # Delete iteration directory if not used
             if len(os.listdir(iter_dir)) == 0:
                 os.rmdir(iter_dir)
