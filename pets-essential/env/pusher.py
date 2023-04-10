@@ -16,7 +16,7 @@ class PusherEnv(mujoco_env.MujocoEnv, utils.EzPickle):
         utils.EzPickle.__init__(self)
         self.reset_model()
 
-    def _step(self, a):
+    def step(self, a):
         obj_pos = self.get_body_com("object"),
         vec_1 = obj_pos - self.get_body_com("tips_arm")
         vec_2 = obj_pos - self.get_body_com("goal")
@@ -27,7 +27,7 @@ class PusherEnv(mujoco_env.MujocoEnv, utils.EzPickle):
         reward = 1.25 * reward_dist + 0.1 * reward_ctrl + 0.5 * reward_near
 
         self.do_simulation(a, self.frame_skip)
-        ob = self._get_obs()
+        ob = self.get_obs()
         done = False
         return ob, reward, done, {}
 
@@ -49,12 +49,12 @@ class PusherEnv(mujoco_env.MujocoEnv, utils.EzPickle):
         self.set_state(qpos, qvel)
         self.ac_goal_pos = self.get_body_com("goal")
 
-        return self._get_obs()
+        return self.get_obs()
 
-    def _get_obs(self):
+    def get_obs(self):
         return np.concatenate([
-            self.model.data.qpos.flat[:7],
-            self.model.data.qvel.flat[:7],
+            self.data.qpos.flat[:7],
+            self.data.qvel.flat[:7],
             self.get_body_com("tips_arm"),
             self.get_body_com("object"),
         ])
