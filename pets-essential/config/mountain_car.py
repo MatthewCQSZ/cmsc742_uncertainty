@@ -85,12 +85,12 @@ class PtModel(nn.Module):
 
 
 class MountainCarConfigModule:
-    ENV_NAME = "MBRLMountainCar-v0"
+    ENV_NAME = "MountainCarContinuous-v0"
     TASK_HORIZON = 200
     NTRAIN_ITERS = 15
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 25
-    MODEL_IN, MODEL_OUT = 6, 4
+    MODEL_IN, MODEL_OUT = 4, 2
     GP_NINDUCING_POINTS = 200
 
     # Create and move this tensor to GPU so that
@@ -134,27 +134,11 @@ class MountainCarConfigModule:
 
     @staticmethod
     def obs_cost_fn(obs):
-        ee_pos = CartpoleConfigModule._get_ee_pos(obs)
-
-        ee_pos -= CartpoleConfigModule.ee_sub
-
-        ee_pos = ee_pos ** 2
-
-        ee_pos = - ee_pos.sum(dim=1)
-
-        return - (ee_pos / (0.6 ** 2)).exp()
+        return -obs[:, 0]
 
     @staticmethod
     def ac_cost_fn(acs):
-        return 0.01 * (acs ** 2).sum(dim=1)
-
-    @staticmethod
-    def _get_ee_pos(obs):
-        x0, theta = obs[:, :1], obs[:, 1:2]
-
-        return torch.cat([
-            x0 - 0.6 * theta.sin(), -0.6 * theta.cos()
-        ], dim=1)
+        return 0.1 * (acs ** 2).sum(dim=1)
 
     def nn_constructor(self, model_init_cfg):
 
@@ -173,4 +157,4 @@ class MountainCarConfigModule:
         return model
 
 
-CONFIG_MODULE = CartpoleConfigModule
+CONFIG_MODULE = MountainCarConfigModule

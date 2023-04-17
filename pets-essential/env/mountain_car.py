@@ -6,4 +6,4 @@ import os
 
 import numpy as np
 from gym import utils
-from gym.envs.classic_control.mountain_car import MountainCarEnv
+from gym.envs.classic_control.continuous_mountain_car import Continuous_MountainCarEnv
