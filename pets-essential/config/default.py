@@ -119,6 +119,10 @@ def _create_ctrl_config(ctrl_cfg, cfg_module, ctrl_type, ctrl_args, type_map):
     ctrl_cfg.prop_cfg.npart = 20
     # Finish setting model class
 
+
+    #Set opt_cfg epistemic reward coef
+    ctrl_cfg.opt_cfg.epi_coef = 0.1
+
     # Setting MPC cfg
     ctrl_cfg.opt_cfg.mode = "CEM"
     type_map.ctrl_cfg.opt_cfg.cfg = DotMap(

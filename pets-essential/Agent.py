@@ -30,7 +30,7 @@ class Agent:
         if isinstance(self.env, DotMap):
             raise ValueError("Environment must be provided to the agent at initialization.")
 
-    def sample(self, horizon, policy, record_fname=None):
+    def sample(self, horizon, policy, train=False, record_fname=None):
         """Samples a rollout from the agent.
 
         Arguments:
@@ -53,7 +53,7 @@ class Agent:
             if video_record:
                 recorder.capture_frame()
             start = time.time()
-            A.append(policy.act(O[t], t))
+            A.append(policy.act(O[t], t, train = train))
             times.append(time.time() - start)
 
             obs, reward, done, info = self.env.step(A[t])

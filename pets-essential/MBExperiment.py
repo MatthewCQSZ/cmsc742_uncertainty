@@ -61,11 +61,12 @@ class MBExperiment:
 
         self.logdir = os.path.join(
             get_required_argument(params.log_cfg, "logdir", "Must provide log parent directory."),
-            strftime("%Y-%m-%d--%H:%M:%S", localtime()) + str(params.sim_cfg.env),
+            strftime("%Y-%m-%d--%H:%M:%S", localtime()) + str(params.sim_cfg.env) + "_epi_coef_" + str(self.policy.epistemic_coef),
             
         )
         self.nrecord = params.log_cfg.get("nrecord", 0)
         self.neval = params.log_cfg.get("neval", 1)
+        self.ntrain = params.log_cfg.get("ntrain", 1)
         self.writer = SummaryWriter(self.logdir)
 
     def run_experiment(self):
@@ -102,20 +103,30 @@ class MBExperiment:
             iter_dir = os.path.join(self.logdir, "train_iter%d" % (i + 1))
             os.makedirs(iter_dir, exist_ok=True)
 
-            samples = []
+            train_samples = []
+            eval_samples = []
 
-            for j in range(max(self.neval, self.nrollouts_per_iter)):
-                samples.append(
+            for j in range(max(self.ntrain, self.nrollouts_per_iter)):
+                train_samples.append(
                     self.agent.sample(
-                        self.task_hor, self.policy
+                        self.task_hor, self.policy, train=True
                     )
                 )
-            print("Rewards obtained:", [sample["reward_sum"] for sample in samples[:self.neval]])
-            traj_obs.extend([sample["obs"] for sample in samples[:self.nrollouts_per_iter]])
-            traj_acs.extend([sample["ac"] for sample in samples[:self.nrollouts_per_iter]])
-            traj_rets.extend([sample["reward_sum"] for sample in samples[:self.neval]])
-            traj_rews.extend([sample["rewards"] for sample in samples[:self.nrollouts_per_iter]])
-            samples = samples[:self.nrollouts_per_iter]
+
+            for j in range(max(self.neval, self.nrollouts_per_iter)):
+                eval_samples.append(
+                    self.agent.sample(
+                        self.task_hor, self.policy, train=False
+                    )
+                )
+            print("Rewards obtained eval:", [sample["reward_sum"] for sample in eval_samples[:self.neval]])
+            print("Rewards obtained train:", [sample["reward_sum"] for sample in eval_samples[:self.neval]])
+            #traj_obs.extend([sample["obs"] for sample in samples[:self.nrollouts_per_iter]])
+            #traj_acs.extend([sample["ac"] for sample in samples[:self.nrollouts_per_iter]])
+            #traj_rets.extend([sample["reward_sum"] for sample in samples[:self.neval]])
+            #traj_rews.extend([sample["rewards"] for sample in samples[:self.nrollouts_per_iter]])
+            train_samples = train_samples[:self.nrollouts_per_iter]
+            eval_samples = eval_samples[:self.nrollouts_per_iter]
 
             #old logging, we changed to tensorboard
             #self.policy.dump_logs(self.logdir, iter_dir)
@@ -131,9 +142,15 @@ class MBExperiment:
 
             #per eval iter logging
             sum_return = 0
-            for j in range(len(samples)):
-                sum_return += samples[j]["reward_sum"]
-            mean_return = sum_return / len(samples)
+            for j in range(len(train_samples)):
+                sum_return += train_samples[j]["reward_sum"]
+            mean_return = sum_return / len(train_samples)
+            self.writer.add_scalar("mean train return vs train iter", mean_return, i)
+
+            sum_return = 0
+            for j in range(len(eval_samples)):
+                sum_return += eval_samples[j]["reward_sum"]
+            mean_return = sum_return / len(eval_samples)
             self.writer.add_scalar("mean eval return vs train iter", mean_return, i)
 
             # Delete iteration directory if not used
@@ -142,7 +159,7 @@ class MBExperiment:
 
             if i < self.ntrain_iters - 1:
                 self.policy.train(
-                    [sample["obs"] for sample in samples],
-                    [sample["ac"] for sample in samples],
-                    [sample["rewards"] for sample in samples]
+                    [sample["obs"] for sample in train_samples],
+                    [sample["ac"] for sample in train_samples],
+                    [sample["rewards"] for sample in train_samples]
                 )

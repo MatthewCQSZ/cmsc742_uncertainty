@@ -141,6 +141,11 @@ class MPC(Controller):
         self.log_traj_preds = params.log_cfg.get("log_traj_preds", False)
         self.log_particles = params.log_cfg.get("log_particles", False)
 
+        #coefficient for adding a bonus for exploring states with high epistemic uncertainty
+        self.epistemic_coef = params.opt_cfg.get("epi_coef", 0.0)
+        self.epistemic_aux = self.epistemic_coef > 0
+        print("Epistemic Aux", self.epistemic_aux)
+
         # Perform argument checks
         assert self.opt_mode == 'CEM'
         assert self.prop_mode == 'TSinf', 'only TSinf propagation mode is supported'
@@ -148,11 +153,19 @@ class MPC(Controller):
 
         # Create action sequence optimizer
         opt_cfg = params.opt_cfg.get("cfg", {})
-        self.optimizer = CEMOptimizer(
+        self.eval_optimizer = CEMOptimizer(
             sol_dim=self.plan_hor * self.dU,
             lower_bound=np.tile(self.ac_lb, [self.plan_hor]),
             upper_bound=np.tile(self.ac_ub, [self.plan_hor]),
-            cost_function=self._compile_cost,
+            cost_function=self._compile_cost_eval,
+            **opt_cfg
+        )
+
+        self.train_optimizer = CEMOptimizer(
+            sol_dim=self.plan_hor * self.dU,
+            lower_bound=np.tile(self.ac_lb, [self.plan_hor]),
+            upper_bound=np.tile(self.ac_ub, [self.plan_hor]),
+            cost_function=self._compile_cost_train,
             **opt_cfg
         )
 
@@ -265,12 +278,13 @@ class MPC(Controller):
         Returns: None
         """
         self.prev_sol = np.tile((self.ac_lb + self.ac_ub) / 2, [self.plan_hor])
-        self.optimizer.reset()
+        self.eval_optimizer.reset()
+        self.train_optimizer.reset()
 
         for update_fn in self.update_fns:
             update_fn()
 
-    def act(self, obs, t, get_pred_cost=False):
+    def act(self, obs, t, train = False, get_pred_cost=False):
         """Returns the action that this controller would take at time t given observation obs.
 
         Arguments:
@@ -289,7 +303,10 @@ class MPC(Controller):
 
         self.sy_cur_obs = obs
 
-        soln = self.optimizer.obtain_solution(self.prev_sol, self.init_var)
+        if train:
+            soln = self.train_optimizer.obtain_solution(self.prev_sol, self.init_var)
+        else:
+            soln = self.eval_optimizer.obtain_solution(self.prev_sol, self.init_var)
         self.prev_sol = np.concatenate([np.copy(soln)[self.per * self.dU:], np.zeros(self.per * self.dU)])
         self.ac_buf = soln[:self.per * self.dU].reshape(-1, self.dU)
 
@@ -320,7 +337,31 @@ class MPC(Controller):
             self.pred_means, self.pred_vars = [], []
     
     @torch.no_grad()
-    def _compile_cost(self, ac_seqs):
+    def get_epistemic_info_rad(self, inputs):
+        #we will use Information Radius at first ex. https://mathoverflow.net/questions/244293/generalisations-of-the-kullback-leibler-divergence-for-more-than-two-distributio
+        #need to figure out how to efficiency compute info radius over many different particles
+        #consider during eval, to compute optimal path with mean of all transition functions, not a single one
+        inputs_tiled = torch.tile(inputs[:, None, :, :], (1, self.model.num_nets, 1, 1))
+        mean, var = self.model(inputs_tiled)
+        average_mean = torch.mean(mean, dim=1)
+        average_var = torch.mean(var, dim=1)
+
+
+        diffs_sq = torch.square(mean - average_mean)
+        k = mean.shape[-1]
+        log_term = torch.sum(torch.log(torch.sqrt(average_var)) - torch.log(torch.sqrt(var)), dim=-1)
+
+        #from https://mr-easy.github.io/2020-04-16-kl-divergence-between-2-gaussian-distributions/
+        kl_d = 0.5 * (log_term - k + torch.sum(((var + diffs_sq) / average_var), dim=-1))
+
+        info_rad = torch.mean(kl_d, dim=1).flatten()
+
+        return info_rad
+    
+
+
+    @torch.no_grad()
+    def _compile_cost(self, ac_seqs, epi_rew = False):
 
         nopt = ac_seqs.shape[0]
 
@@ -353,9 +394,13 @@ class MPC(Controller):
         for t in range(self.plan_hor):
             cur_acs = ac_seqs[t]
 
-            next_obs = self._predict_next_obs(cur_obs, cur_acs)
+            next_obs, inputs = self._predict_next_obs(cur_obs, cur_acs)
 
             cost = self.obs_cost_fn(next_obs) + self.ac_cost_fn(cur_acs)
+
+            if self.epistemic_aux:
+                cost -= self.epistemic_coef * self.get_epistemic_info_rad(inputs)
+
 
             cost = cost.view(-1, self.npart)
 
@@ -364,8 +409,18 @@ class MPC(Controller):
 
         # Replace nan with high cost
         costs[costs != costs] = 1e6
+        retVal = costs.mean(dim=1).detach().cpu().numpy()
+        #print("Cost Stats")
+        #print(np.mean(retVal), np.var(retVal))
+        return retVal
 
-        return costs.mean(dim=1).detach().cpu().numpy()
+    @torch.no_grad()
+    def _compile_cost_eval(self, ac_seqs):
+        return self._compile_cost(ac_seqs, epi_rew=False)
+
+    @torch.no_grad()
+    def _compile_cost_train(self, ac_seqs):
+        return self._compile_cost(ac_seqs, epi_rew=True)
 
     def _predict_next_obs(self, obs, acs):
         proc_obs = self.obs_preproc(obs)
@@ -384,7 +439,7 @@ class MPC(Controller):
         # TS Optimization: Remove additional dimension
         predictions = self._flatten_to_matrix(predictions)
 
-        return self.obs_postproc(obs, predictions)
+        return self.obs_postproc(obs, predictions), inputs
 
     def _expand_to_ts_format(self, mat):
         dim = mat.shape[-1]
