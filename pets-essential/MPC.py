@@ -248,7 +248,7 @@ class MPC(Controller):
 
                 mean, logvar = self.model(train_in, ret_logvar=True)
                 inv_var = torch.exp(-logvar)
-
+                
                 train_losses = ((mean - train_targ) ** 2) * inv_var + logvar
                 train_losses = train_losses.mean(-1).mean(-1).sum()
                 # Only taking mean over the last 2 dimensions
