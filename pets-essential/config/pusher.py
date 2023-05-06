@@ -72,9 +72,9 @@ class PtModel(nn.Module):
 
         inputs = inputs.matmul(self.lin3_w) + self.lin3_b
 
-        mean = inputs[:, :, :self.out_features // 2]
+        mean = inputs[..., :self.out_features // 2]
 
-        logvar = inputs[:, :, self.out_features // 2:]
+        logvar = inputs[..., self.out_features // 2:]
         logvar = self.max_logvar - F.softplus(self.max_logvar - logvar)
         logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
 
@@ -87,7 +87,7 @@ class PtModel(nn.Module):
 class PusherConfigModule:
     ENV_NAME = "MBRLPusher-v0"
     TASK_HORIZON = 150
-    NTRAIN_ITERS = 100
+    NTRAIN_ITERS = 50
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 25
     MODEL_IN, MODEL_OUT = 27, 20

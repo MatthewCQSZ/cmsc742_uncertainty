@@ -14,6 +14,10 @@ from tqdm import trange
 
 import torch
 
+import optax
+import haiku as hk
+import jax
+
 TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 print(f"Running on TORCH_DEVICE:{TORCH_DEVICE}")
@@ -197,6 +201,8 @@ class MPC(Controller):
         self.model = get_required_argument(
             params.prop_cfg.model_init_cfg, "model_constructor", "Must provide a model constructor."
         )(params.prop_cfg.model_init_cfg)
+        
+        
 
     def train(self, obs_trajs, acs_trajs, rews_trajs):
         """Trains the internal model of this controller. Once trained,
@@ -247,6 +253,21 @@ class MPC(Controller):
                 train_targ = torch.from_numpy(self.train_targs[batch_idxs]).to(TORCH_DEVICE).float()
 
                 mean, logvar = self.model(train_in, ret_logvar=True)
+                print(mean.shape)
+                print(logvar.shape)
+                print(train_in.shape)
+                
+                enn_out = self.model.enn.apply(self.model.enn_params, 
+                                               self.model.enn_state, 
+                                               train_in.cpu().detach().numpy(), 
+                                               next(self.model.rng)) # params, state, inputs, index
+                print(enn_out.shape)
+                
+                # TODO: match inputs size to ENN
+                # ValueError: 'mlp/~/linear_0/w' with retrieved shape (2, 6, 8) does not match shape=[192, 8] dtype=dtype('float32')
+                
+                # TODO: add ENN output to base network output
+                exit()
                 inv_var = torch.exp(-logvar)
                 
                 train_losses = ((mean - train_targ) ** 2) * inv_var + logvar
@@ -259,6 +280,15 @@ class MPC(Controller):
                 self.model.optim.zero_grad()
                 loss.backward()
                 self.model.optim.step()
+                
+                
+                # Update ENN
+                loss_output, grads = jax.value_and_grad(self._loss, has_aux=True)(
+                self.model.enn_params, self.model.enn_state, train_in.cpu().detach().numpy(), next(self.model.rng))
+                loss, ( self.model.enn_state, loss_metrics) = loss_output
+                loss_metrics.update({'loss': loss})
+                updates, new_opt_state = optimizer.update(grads, self.model.opt_state)
+                self.model.enn_params = optax.apply_updates(self.model.enn_params, updates)
 
             idxs = shuffle_rows(idxs)
 

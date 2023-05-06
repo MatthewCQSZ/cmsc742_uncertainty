@@ -11,6 +11,12 @@ import torch
 from torch import nn as nn
 from torch.nn import functional as F
 
+from enn import losses
+from enn import networks
+import optax
+import haiku as hk
+import jax
+
 TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 
@@ -87,7 +93,7 @@ class PtModel(nn.Module):
 class CartpoleConfigModule:
     ENV_NAME = "MBRLCartpole-v0"
     TASK_HORIZON = 200
-    NTRAIN_ITERS = 15
+    NTRAIN_ITERS = 50
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 25
     MODEL_IN, MODEL_OUT = 6, 4
@@ -169,6 +175,30 @@ class CartpoleConfigModule:
         # * 2 because we output both the mean and the variance
 
         model.optim = torch.optim.Adam(model.parameters(), lr=0.001)
+        
+        # TODO: flexible parameters
+        seed = 0
+        model.rng = hk.PRNGSequence(seed)
+        
+        # ENN, default everything
+        model.enn = networks.MLPEnsembleMatchedPrior(
+            output_sizes=[self.MODEL_OUT * 2],
+            dummy_input = np.zeros(self.MODEL_IN),
+            num_ensemble=10,
+        )
+        
+        index = model.enn.indexer(next(model.rng))
+        model.enn_params, model.enn_state = model.enn.init(next(model.rng), np.zeros(self.MODEL_IN), index)
+        
+        # Loss
+        model.enn_loss_fn = losses.average_single_index_loss(
+            single_loss=losses.L2Loss(),
+            num_index_samples=10
+        )
+
+        # Optimizer
+        model.enn_optimizer = optax.adam(1e-3)
+        model.opt_state = model.enn_optimizer.init(model.enn_params)
 
         return model
 
