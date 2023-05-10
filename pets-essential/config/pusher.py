@@ -87,7 +87,7 @@ class PtModel(nn.Module):
 class PusherConfigModule:
     ENV_NAME = "MBRLPusher-v0"
     TASK_HORIZON = 150
-    NTRAIN_ITERS = 100
+    NTRAIN_ITERS = 50
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 25
     MODEL_IN, MODEL_OUT = 27, 20

@@ -80,9 +80,9 @@ class PtModel(nn.Module):
 
         inputs = inputs.matmul(self.lin4_w) + self.lin4_b
 
-        mean = inputs[:, :, :self.out_features // 2]
+        mean = inputs[..., :self.out_features // 2]
 
-        logvar = inputs[:, :, self.out_features // 2:]
+        logvar = inputs[..., self.out_features // 2:]
         logvar = self.max_logvar - F.softplus(self.max_logvar - logvar)
         logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
 
@@ -95,7 +95,7 @@ class PtModel(nn.Module):
 class HalfCheetahConfigModule:
     ENV_NAME = "MBRLHalfCheetah-v0"
     TASK_HORIZON = 1000
-    NTRAIN_ITERS = 300
+    NTRAIN_ITERS = 50
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 30
     MODEL_IN, MODEL_OUT = 24, 18

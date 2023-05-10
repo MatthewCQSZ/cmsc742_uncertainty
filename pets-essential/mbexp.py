@@ -58,7 +58,7 @@ if __name__ == "__main__":
                         help='Controller arguments, see https://github.com/kchua/handful-of-trials#controller-arguments')
     parser.add_argument('-o', '--override', action='append', nargs=2, default=[],
                         help='Override default parameters, see https://github.com/kchua/handful-of-trials#overrides')
-    parser.add_argument('-logdir', type=str, default='log',
+    parser.add_argument('-logdir', type=str, default='log_test_April22_epi_0001',
                         help='Directory to which results will be logged (default: ./log)')
     args = parser.parse_args()
 

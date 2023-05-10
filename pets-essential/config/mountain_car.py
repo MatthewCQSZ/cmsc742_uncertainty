@@ -87,7 +87,7 @@ class PtModel(nn.Module):
 class MountainCarConfigModule:
     ENV_NAME = "MountainCarContinuous-v0"
     TASK_HORIZON = 200
-    NTRAIN_ITERS = 15
+    NTRAIN_ITERS = 50
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 25
     MODEL_IN, MODEL_OUT = 4, 2
@@ -95,7 +95,7 @@ class MountainCarConfigModule:
 
     # Create and move this tensor to GPU so that
     # we do not waste time moving it repeatedly to GPU later
-    ee_sub = torch.tensor([0.0, 0.6], device=TORCH_DEVICE, dtype=torch.float)
+    #ee_sub = torch.tensor([0.0, 0.6], device=TORCH_DEVICE, dtype=torch.float)
 
     def __init__(self):
         self.ENV = gym.make(self.ENV_NAME)
@@ -134,11 +134,11 @@ class MountainCarConfigModule:
 
     @staticmethod
     def obs_cost_fn(obs):
-        return -obs[:, 0]
+        return 1 * torch.from_numpy(np.ones(obs[:, 0].shape)).to(TORCH_DEVICE)
 
     @staticmethod
     def ac_cost_fn(acs):
-        return 0.1 * (acs ** 2).sum(dim=1)
+        return  0.1 * (acs ** 2).sum(dim=1)
 
     def nn_constructor(self, model_init_cfg):
 
