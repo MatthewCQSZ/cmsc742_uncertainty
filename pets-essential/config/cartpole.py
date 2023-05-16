@@ -3,7 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 from DotmapUtils import get_required_argument
-from config.utils import swish, get_affine_params, log_likelihood, kl_divergence, TrainingState, LogLoss
+from config.utils import swish, get_affine_params, TrainingState
 
 import gym
 import numpy as np
@@ -16,11 +16,9 @@ from enn import networks
 import optax
 import haiku as hk
 import jax
-import chex
 import jax.numpy as jnp
-from jaxlib.xla_extension import ArrayImpl
 
-TORCH_DEVICE = torch.device('cpu') if torch.cuda.is_available() else torch.device('cpu')
+TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 #get gpu device for jax allocation
 assert len(jax.devices("gpu")) > 0
@@ -198,11 +196,6 @@ class CartpoleConfigModule:
         # TODO: flexible parameters
         seed = 0
         model.rng = hk.PRNGSequence(seed)
-
-        #print("Model in above")
-        
-        # ENN, default everything
-        #model.enn = networks.IndexMLPEnn(output_sizes=[50, 50, self.MODEL_OUT * 2], index_dim=1)
         
         model.enn = networks.MLPEnsembleMatchedPrior(
             output_sizes=[50, 50, self.MODEL_OUT * 2],
@@ -214,20 +207,22 @@ class CartpoleConfigModule:
         model.enn_params, model.enn_network_state = model.enn.init(next(model.rng), np.zeros((32, 6)), index) #rng, inputs, index
         
         
-        #losses.VaeLoss(log_likelihood_fn=log_likelihood, latent_kl_fn=kl_divergence)
-        
-        #losses.average_single_index_loss(
-        #    single_loss=losses.L2Loss(),
-        #    num_index_samples=1
-        #)
         
         # Optimizer
         model.enn_optimizer = optax.adam(1e-3)
         model.opt_state = model.enn_optimizer.init(model.enn_params)
         model.enn_state = TrainingState(model.enn_params, model.enn_network_state, model.opt_state)
         
+        def model_apply(x,
+                        index,):
+            net_out, state = model.enn.apply(model.enn_state.params, model.enn_state.network_state, x, index)
+            net_out = networks.parse_net_output(net_out)
+            mean = net_out[:,:4]
+            logvar = net_out[:,4:]
+            return mean, logvar
+
+        model.enn_apply = model_apply
         
-    
         class LogLoss(losses_base.SingleLossFnArray):
             def __call__(self,
                             params: hk.Params,
@@ -241,7 +236,7 @@ class CartpoleConfigModule:
                     logvar = net_out[:,4:]
                     inv_var = jnp.exp(-logvar)      
                     train_losses = ((mean - y) ** 2) * inv_var + logvar
-                    return jnp.mean(train_losses)
+                    return jnp.mean(train_losses), net_out
                 
         model.enn_loss_fn = LogLoss()
         return model

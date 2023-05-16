@@ -22,8 +22,7 @@ import jax.numpy as jnp
 
 from config.utils import TrainingState
 
-#TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-TORCH_DEVICE = torch.device('cpu') if torch.cuda.is_available() else torch.device('cpu')
+TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 print(f"Running on TORCH_DEVICE:{TORCH_DEVICE}")
 
@@ -156,7 +155,7 @@ class MPC(Controller):
         print("Epistemic Aux", self.epistemic_aux)
 
         #bool for whether epinet
-        self.epinet = self.model_init_cfg.epinet
+        self.epinet = params.opt_cfg.get("epinet", True)
         print("Epinet", self.epinet)
 
         # Perform argument checks
@@ -262,17 +261,16 @@ class MPC(Controller):
                 loss = 0.01 * (self.model.max_logvar.sum() - self.model.min_logvar.sum())
                 loss += self.model.compute_decays()
 
-                # TODO: move all training data to GPU before hand
                 if self.epinet:
                     train_in = jax.device_put(self.train_in[batch_idxs], self.gpu)[0]
                     train_targ = jax.device_put(self.train_targs[batch_idxs], self.gpu)[0]
-                    index = self.model.enn.indexer(next(self.model.rng))
+                    self.index = self.model.enn.indexer(next(self.model.rng))
 
-                    grads = jax.grad(self.model.enn_loss_fn)(self.model.enn_state.params, 
+                    grads, net_out = jax.grad(self.model.enn_loss_fn, has_aux=True)(self.model.enn_state.params, 
                                                             self.model.enn_state.network_state, 
                                                             train_in,
                                                             train_targ, 
-                                                            index)
+                                                            self.index)
                     updates, new_opt_state = self.model.enn_optimizer.update(grads, self.model.enn_state.opt_state)
                     new_params = optax.apply_updates(self.model.enn_state.params, updates)
                     new_state = TrainingState(
@@ -282,16 +280,7 @@ class MPC(Controller):
                         )
                     
                     self.model.enn_state = new_state
-                    #train_in = train_in.detach().cpu().numpy()
-                    #train_targ_0 = train_targ[0].detach().cpu().numpy()
 
-                    #enn_out, network_state = self.model.enn.apply(self.model.enn_state.params, 
-                    #                               self.model.enn_state.network_state, 
-                    #                               train_in, 
-                    #                               index) # params, state, inputs, index
-                    
-                    # Update ENN
-                    
                     # TODO: add ENN output to base network output
                 else:
                     train_in = torch.from_numpy(self.train_in[batch_idxs]).to(TORCH_DEVICE).float()
@@ -392,114 +381,155 @@ class MPC(Controller):
         #we will use Information Radius at first ex. https://mathoverflow.net/questions/244293/generalisations-of-the-kullback-leibler-divergence-for-more-than-two-distributio
         #need to figure out how to efficiency compute info radius over many different particles
         #consider during eval, to compute optimal path with mean of all transition functions, not a single one
-        inputs_tiled = torch.tile(inputs[:, None, :, :], (1, self.model.num_nets, 1, 1))
-        mean, var = self.model(inputs_tiled)
-        average_mean = torch.mean(mean, dim=1)
-        average_var = torch.mean(var, dim=1)
+        if self.epinet:
+            #inputs = inputs[None, :]
+            #inputs_tiled = jnp.tile(inputs[:, None, :, :], (1, self.model.num_nets, 1, 1))
+            mean, var = self.model.enn_apply(inputs, self.index)
+            average_mean = jnp.mean(mean)
+            average_var = jnp.mean(var)
 
 
-        diffs_sq = torch.square(mean - average_mean)
-        k = mean.shape[-1]
-        log_term = torch.sum(torch.log(torch.sqrt(average_var)) - torch.log(torch.sqrt(var)), dim=-1)
+            diffs_sq = jnp.square(mean - average_mean)
+            k = mean.shape[-1]
+            log_term = jnp.sum(jnp.log(jnp.sqrt(average_var)) - jnp.log(jnp.sqrt(var)))
 
-        #from https://mr-easy.github.io/2020-04-16-kl-divergence-between-2-gaussian-distributions/
-        kl_d = 0.5 * (log_term - k + torch.sum(((var + diffs_sq) / average_var), dim=-1))
+            #from https://mr-easy.github.io/2020-04-16-kl-divergence-between-2-gaussian-distributions/
+            kl_d = 0.5 * (log_term - k + jnp.sum(((var + diffs_sq) / average_var)))
 
-        info_rad = torch.mean(kl_d, dim=1).flatten()
+            info_rad = jnp.mean(kl_d)
+
+            
+        else:
+            inputs_tiled = torch.tile(inputs[:, None, :, :], (1, self.model.num_nets, 1, 1))
+            mean, var = self.model(inputs_tiled)
+            average_mean = torch.mean(mean, dim=1)
+            average_var = torch.mean(var, dim=1)
+
+
+            diffs_sq = torch.square(mean - average_mean)
+            k = mean.shape[-1]
+            log_term = torch.sum(torch.log(torch.sqrt(average_var)) - torch.log(torch.sqrt(var)), dim=-1)
+
+            #from https://mr-easy.github.io/2020-04-16-kl-divergence-between-2-gaussian-distributions/
+            kl_d = 0.5 * (log_term - k + torch.sum(((var + diffs_sq) / average_var), dim=-1))
+
+            info_rad = torch.mean(kl_d, dim=1).flatten()
 
         return info_rad
     
 
-
-    #@torch.no_grad()
-    @partial(jax.jit, static_argnums=(0, 4))
-    def _compile_cost(self, ac_seqs, rng1, rng2, epi_rew = False):
+    @torch.no_grad()
+    def _compile_cost_torch(self, ac_seqs, rng1, rng2, epi_rew = False):
 
         nopt = ac_seqs.shape[0]
 
+        ac_seqs = torch.from_numpy(ac_seqs).float().to(TORCH_DEVICE)
 
-        # Expand current observation
-        if self.epinet:
-            ac_seqs = jax.device_put(jnp.array(ac_seqs), self.gpu)
-            ac_seqs = jax.lax.stop_gradient(ac_seqs) 
-            ac_seqs = jnp.reshape(ac_seqs, (-1, self.plan_hor, self.dU))
-            transposed = jnp.transpose(ac_seqs, (1, 0, 2))
-            expanded = transposed[:, :, None]
-            tiled = jnp.repeat(expanded, self.npart, 2)
-            ac_seqs = jnp.reshape(tiled, (self.plan_hor, -1, self.dU))
+        # Reshape ac_seqs so that it's amenable to parallel compute
+        # Before, ac seqs has dimension (400, 25) which are pop size and sol dim coming from CEM
+        ac_seqs = ac_seqs.view(-1, self.plan_hor, self.dU)
+        #  After, ac seqs has dimension (400, 25, 1)
 
-            cur_obs = jnp.array(self.sy_cur_obs)
-            cur_obs = jax.lax.stop_gradient(cur_obs) 
-            cur_obs = jax.device_put(cur_obs, self.gpu)
-            cur_obs = cur_obs[None]
-            cur_obs = jnp.repeat(cur_obs, nopt * self.npart, axis=0)
+        transposed = ac_seqs.transpose(0, 1)
+        # Then, (25, 400, 1)
 
-            costs = jax.device_put(jnp.zeros((nopt, self.npart)), self.gpu)
-            costs = jax.lax.stop_gradient(costs)
-        else:
-            ac_seqs = torch.from_numpy(ac_seqs).float().to(TORCH_DEVICE)
+        expanded = transposed[:, :, None]
+        # Then, (25, 400, 1, 1)
 
-            # Reshape ac_seqs so that it's amenable to parallel compute
-            # Before, ac seqs has dimension (400, 25) which are pop size and sol dim coming from CEM
-            ac_seqs = ac_seqs.view(-1, self.plan_hor, self.dU)
-            #  After, ac seqs has dimension (400, 25, 1)
+        tiled = expanded.expand(-1, -1, self.npart, -1)
+        # Then, (25, 400, 20, 1)
 
-            transposed = ac_seqs.transpose(0, 1)
-            # Then, (25, 400, 1)
+        ac_seqs = tiled.contiguous().view(self.plan_hor, -1, self.dU)
+        # Then, (25, 8000, 1)
+        cur_obs = torch.from_numpy(self.sy_cur_obs).float().to(TORCH_DEVICE)
+        cur_obs = cur_obs[None]
+        cur_obs = cur_obs.expand(nopt * self.npart, -1)
 
-            expanded = transposed[:, :, None]
-            # Then, (25, 400, 1, 1)
-
-            tiled = expanded.expand(-1, -1, self.npart, -1)
-            # Then, (25, 400, 20, 1)
-
-            ac_seqs = tiled.contiguous().view(self.plan_hor, -1, self.dU)
-            # Then, (25, 8000, 1)
-            cur_obs = torch.from_numpy(self.sy_cur_obs).float().to(TORCH_DEVICE)
-            cur_obs = cur_obs[None]
-            cur_obs = cur_obs.expand(nopt * self.npart, -1)
-
-            costs = torch.zeros(nopt, self.npart, device=TORCH_DEVICE)
+        costs = torch.zeros(nopt, self.npart, device=TORCH_DEVICE)
 
         for t in range(self.plan_hor):
             cur_acs = ac_seqs[t]
-            if self.epinet:
-                next_obs, inputs = self._predict_next_obs_epinet(cur_obs, cur_acs, rng1, rng2)
-            else:
-                next_obs, inputs = self._predict_next_obs_vanilla(cur_obs, cur_acs)
+            next_obs, inputs = self._predict_next_obs_vanilla(cur_obs, cur_acs)
 
             cost = self.obs_cost_fn(next_obs) + self.ac_cost_fn(cur_acs)
+            
 
             if self.epistemic_aux:
                 cost -= self.epistemic_coef * self.get_epistemic_info_rad(inputs)
 
-
-            if self.epinet:
-                cost = cost.reshape(-1, self.npart)
-            else:
                 cost = cost.view(-1, self.npart)
+                
+            cost = torch.reshape(cost, costs.shape)
 
             costs += cost
             cur_obs = self.obs_postproc2(next_obs)
 
         # Replace nan with high cost
-        if self.epinet:
-            costs = jnp.nan_to_num(costs, copy=False, nan=1e6)
-            retVal = jnp.mean(costs, axis=1)
-        else:
-            costs[costs != costs] = 1e6
-            retVal = costs.mean(dim=1).detach().cpu()
-        #print("Cost Stats")
-        #print(np.mean(retVal), np.var(retVal))
+        costs[costs != costs] = 1e6
+        retVal = costs.mean(dim=1).detach().cpu()
+
+        return retVal
+    
+    @partial(jax.jit, static_argnums=(0, 4))
+    def _compile_cost_jax(self, ac_seqs, rng1, rng2, epi_rew = False):
+
+        nopt = ac_seqs.shape[0]
+
+        # Expand current observation
+
+        ac_seqs = jax.device_put(jnp.array(ac_seqs), self.gpu)
+        ac_seqs = jax.lax.stop_gradient(ac_seqs) 
+        ac_seqs = jnp.reshape(ac_seqs, (-1, self.plan_hor, self.dU))
+        transposed = jnp.transpose(ac_seqs, (1, 0, 2))
+        expanded = transposed[:, :, None]
+        tiled = jnp.repeat(expanded, self.npart, 2)
+        ac_seqs = jnp.reshape(tiled, (self.plan_hor, -1, self.dU))
+
+        cur_obs = jnp.array(self.sy_cur_obs)
+        cur_obs = jax.lax.stop_gradient(cur_obs) 
+        cur_obs = jax.device_put(cur_obs, self.gpu)
+        cur_obs = cur_obs[None]
+        cur_obs = jnp.repeat(cur_obs, nopt * self.npart, axis=0)
+
+        costs = jax.device_put(jnp.zeros((nopt, self.npart)), self.gpu)
+        costs = jax.lax.stop_gradient(costs)
+
+
+        for t in range(self.plan_hor):
+            cur_acs = ac_seqs[t]
+            next_obs, inputs = self._predict_next_obs_epinet(cur_obs, cur_acs, rng1, rng2)
+
+            cost = self.obs_cost_fn(next_obs) + self.ac_cost_fn(cur_acs)
+            
+
+            if self.epistemic_aux:
+                cost -= self.epistemic_coef * self.get_epistemic_info_rad(inputs)
+
+
+            cost = cost.reshape(-1, self.npart)
+
+            costs += cost
+            cur_obs = self.obs_postproc2(next_obs)
+
+        # Replace nan with high cost
+        costs = jnp.nan_to_num(costs, copy=False, nan=1e6)
+        retVal = jnp.mean(costs, axis=1)
+
         return retVal
 
     @torch.no_grad()
     def _compile_cost_eval(self, ac_seqs):
-        return np.array(self._compile_cost(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=False))
+        if self.epinet:
+            return np.array(self._compile_cost_jax(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=False))
+        else:
+            return np.array(self._compile_cost_torch(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=False))
 
     @torch.no_grad()
     def _compile_cost_train(self, ac_seqs):
-        return np.array(self._compile_cost(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=True))
+        if self.epinet:
+            return np.array(self._compile_cost_jax(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=False))
+        else:
+            return np.array(self._compile_cost_torch(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=False))
 
     def _predict_next_obs_vanilla(self, obs, acs):
         proc_obs = self.obs_preproc(obs)

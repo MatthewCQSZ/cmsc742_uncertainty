@@ -30,11 +30,13 @@ def set_global_seeds(seed):
     tf.random.set_seed(seed)
 
 
-def main(env, ctrl_type, ctrl_args, overrides, logdir):
+def main(env, ctrl_type, ctrl_args, overrides, args):
     set_global_seeds(0)
-
+    
+    ctrl_args.append(("epinet", args.epinet))
+    ctrl_args.append(("epi_coef", args.epi_coef))
     ctrl_args = DotMap(**{key: val for (key, val) in ctrl_args})
-    cfg = create_config(env, ctrl_type, ctrl_args, overrides, logdir)
+    cfg = create_config(env, ctrl_type, ctrl_args, overrides, args.logdir)
     cfg.pprint()
 
     assert ctrl_type == 'MPC'
@@ -58,8 +60,12 @@ if __name__ == "__main__":
                         help='Controller arguments, see https://github.com/kchua/handful-of-trials#controller-arguments')
     parser.add_argument('-o', '--override', action='append', nargs=2, default=[],
                         help='Override default parameters, see https://github.com/kchua/handful-of-trials#overrides')
-    parser.add_argument('-logdir', type=str, default='log_test_April22_epi_0001',
+    parser.add_argument('-logdir', type=str, default='log_test',
                         help='Directory to which results will be logged (default: ./log)')
+    parser.add_argument('-epinet', action='store_true', default=False,
+                        help='Use Epinet')
+    parser.add_argument('-epi_coef', type=float, default=0,
+                        help='Epistemic reward coef')
     args = parser.parse_args()
 
-    main(args.env, "MPC", args.ctrl_arg, args.override, args.logdir)
+    main(args.env, "MPC", args.ctrl_arg, args.override, args)

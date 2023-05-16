@@ -3,7 +3,14 @@ from __future__ import division
 from __future__ import print_function
 
 from DotmapUtils import get_required_argument
-from config.utils import swish, get_affine_params
+from config.utils import swish, get_affine_params, TrainingState
+
+from enn.losses import base as losses_base
+from enn import networks
+import optax
+import haiku as hk
+import jax
+import jax.numpy as jnp
 
 import gym
 import numpy as np
@@ -12,6 +19,9 @@ from torch import nn as nn
 from torch.nn import functional as F
 
 TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+assert len(jax.devices("gpu")) > 0
+gpu = jax.devices("gpu")[0]
 
 
 class PtModel(nn.Module):
@@ -123,6 +133,8 @@ class MountainCarConfigModule:
                 obs[:, :1],
                 obs[:, 2:]
             ], dim=1)
+        else:
+            return jnp.concatenate([jnp.sin(obs[:, 1:2]), jnp.cos(obs[:, 1:2]), obs[:, :1], obs[:, 2:]], axis=1)
 
     @staticmethod
     def obs_postproc(obs, pred):
@@ -134,11 +146,18 @@ class MountainCarConfigModule:
 
     @staticmethod
     def obs_cost_fn(obs):
-        return 1 * torch.from_numpy(np.ones(obs[:, 0].shape)).to(TORCH_DEVICE)
+        if isinstance(obs, np.ndarray):
+            return torch.from_numpy(np.ones(obs[:, 0].shape)).to(TORCH_DEVICE)
+        else: 
+            return jax.device_put(jnp.ones(obs[:, 0].shape), gpu)
+            
 
     @staticmethod
     def ac_cost_fn(acs):
-        return  0.1 * (acs ** 2).sum(dim=1)
+        if isinstance(acs, torch.Tensor):
+            return 0.01 * (acs ** 2).sum(dim=1)
+        else:
+            return 0.01 * jnp.sum((acs ** 2), axis=1)
 
     def nn_constructor(self, model_init_cfg):
 
@@ -153,6 +172,53 @@ class MountainCarConfigModule:
         # * 2 because we output both the mean and the variance
 
         model.optim = torch.optim.Adam(model.parameters(), lr=0.001)
+        
+        # TODO: flexible parameters
+        seed = 0
+        model.rng = hk.PRNGSequence(seed)
+        
+        model.enn = networks.MLPEnsembleMatchedPrior(
+            output_sizes=[50, 50, self.MODEL_OUT * 2],
+            dummy_input = np.zeros((32, self.MODEL_IN)),
+            num_ensemble=ensemble_size,
+        )
+        
+        index = model.enn.indexer(next(model.rng))
+        model.enn_params, model.enn_network_state = model.enn.init(next(model.rng), np.zeros((32, self.MODEL_IN)), index) #rng, inputs, index
+        
+        
+        
+        # Optimizer
+        model.enn_optimizer = optax.adam(1e-3)
+        model.opt_state = model.enn_optimizer.init(model.enn_params)
+        model.enn_state = TrainingState(model.enn_params, model.enn_network_state, model.opt_state)
+        
+        def model_apply(x,
+                        index,):
+            net_out, state = model.enn.apply(model.enn_params, model.enn_network_state, x, index)
+            net_out = networks.parse_net_output(net_out)
+            mean = net_out[:,:2]
+            logvar = net_out[:,2:]
+            return mean, logvar
+
+        model.enn_apply = model_apply
+        
+        class LogLoss(losses_base.SingleLossFnArray):
+            def __call__(self,
+                            params: hk.Params,
+                            state: hk.State,
+                            x,
+                            y,
+                            index, ):
+                    net_out, state = model.enn.apply(params, state, x, index)
+                    net_out = networks.parse_net_output(net_out)
+                    mean = net_out[:,:2]
+                    logvar = net_out[:,2:]
+                    inv_var = jnp.exp(-logvar)      
+                    train_losses = ((mean - y) ** 2) * inv_var + logvar
+                    return jnp.mean(train_losses), net_out
+                
+        model.enn_loss_fn = LogLoss()
 
         return model
 

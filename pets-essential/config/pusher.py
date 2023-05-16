@@ -9,9 +9,19 @@ from torch import nn as nn
 from torch.nn import functional as F
 
 from DotmapUtils import get_required_argument
-from config.utils import swish, get_affine_params
+from config.utils import swish, get_affine_params, TrainingState
+
+from enn.losses import base as losses_base
+from enn import networks
+import optax
+import haiku as hk
+import jax
+import jax.numpy as jnp
 
 TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+assert len(jax.devices("gpu")) > 0
+gpu = jax.devices("gpu")[0]
 
 
 class PtModel(nn.Module):
@@ -90,7 +100,7 @@ class PusherConfigModule:
     NTRAIN_ITERS = 50
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 25
-    MODEL_IN, MODEL_OUT = 27, 20
+    MODEL_IN, MODEL_OUT = 28, 20
     GP_NINDUCING_POINTS = 200
 
     def __init__(self):
@@ -113,6 +123,20 @@ class PusherConfigModule:
         # to minimize communication overhead
         self.prev_ac_goal_pos = None
         self.goal_pos_gpu = None
+        
+    @staticmethod
+    def obs_preproc(obs):
+        if isinstance(obs, np.ndarray):
+           return np.concatenate([np.sin(obs[:, 1:2]), np.cos(obs[:, 1:2]), obs[:, :1], obs[:, 2:]], axis=1)
+        elif isinstance(obs, torch.Tensor):
+            return torch.cat([
+                obs[:, 1:2].sin(),
+                obs[:, 1:2].cos(),
+                obs[:, :1],
+                obs[:, 2:]
+            ], dim=1)
+        else:
+            return jnp.concatenate([jnp.sin(obs[:, 1:2]), jnp.cos(obs[:, 1:2]), obs[:, :1], obs[:, 2:]], axis=1)
 
     @staticmethod
     def obs_postproc(obs, pred):
@@ -125,9 +149,6 @@ class PusherConfigModule:
     def obs_cost_fn(self, obs):
         to_w, og_w = 0.5, 1.25
         tip_pos, obj_pos, goal_pos = obs[:, 14:17], obs[:, 17:20], self.ENV.ac_goal_pos
-
-        assert isinstance(obs, torch.Tensor)
-
         should_replace = False
 
         # If there was a previous goal pos
@@ -141,18 +162,34 @@ class PusherConfigModule:
             # then we also move the goal pos to GPU
             should_replace = True
 
-        if should_replace:
-            self.goal_pos_gpu = torch.from_numpy(goal_pos).float().to(TORCH_DEVICE)
-            self.prev_ac_goal_pos = goal_pos
+        if isinstance(obs, torch.Tensor):
 
-        tip_obj_dist = (tip_pos - obj_pos).abs().sum(dim=1)
-        obj_goal_dist = (self.goal_pos_gpu - obj_pos).abs().sum(dim=1)
+            if should_replace:
+                self.goal_pos_gpu = torch.from_numpy(goal_pos).float().to(TORCH_DEVICE)
+                self.prev_ac_goal_pos = goal_pos
 
-        return to_w * tip_obj_dist + og_w * obj_goal_dist
+            tip_obj_dist = (tip_pos - obj_pos).abs().sum(dim=1)
+            obj_goal_dist = (self.goal_pos_gpu - obj_pos).abs().sum(dim=1)
+
+            return to_w * tip_obj_dist + og_w * obj_goal_dist
+        
+        else:
+
+            if should_replace:
+                self.goal_pos_gpu = jax.device_put(goal_pos, gpu)
+                self.prev_ac_goal_pos = goal_pos
+
+            tip_obj_dist = jnp.sum(jnp.abs((tip_pos - obj_pos)), axis = 1)
+            obj_goal_dist = jnp.sum(jnp.abs((self.goal_pos_gpu - obj_pos)), axis = 1) 
+
+            return to_w * tip_obj_dist + og_w * obj_goal_dist
 
     @staticmethod
     def ac_cost_fn(acs):
-        return 0.1 * (acs ** 2).sum(dim=1)
+        if isinstance(acs, torch.Tensor):
+            return 0.01 * (acs ** 2).sum(dim=1)
+        else:
+            return 0.01 * jnp.sum((acs ** 2), axis=1)
 
     def nn_constructor(self, model_init_cfg):
         ensemble_size = get_required_argument(model_init_cfg, "num_nets", "Must provide ensemble size")
@@ -166,6 +203,53 @@ class PusherConfigModule:
         # * 2 because we output both the mean and the variance
 
         model.optim = torch.optim.Adam(model.parameters(), lr=0.001)
+        
+        # TODO: flexible parameters
+        seed = 0
+        model.rng = hk.PRNGSequence(seed)
+        
+        model.enn = networks.MLPEnsembleMatchedPrior(
+            output_sizes=[50, 50, self.MODEL_OUT * 2],
+            dummy_input = np.zeros((32, self.MODEL_IN)),
+            num_ensemble=ensemble_size,
+        )
+        
+        index = model.enn.indexer(next(model.rng))
+        model.enn_params, model.enn_network_state = model.enn.init(next(model.rng), np.zeros((32, self.MODEL_IN)), index) #rng, inputs, index
+        
+        
+        
+        # Optimizer
+        model.enn_optimizer = optax.adam(1e-3)
+        model.opt_state = model.enn_optimizer.init(model.enn_params)
+        model.enn_state = TrainingState(model.enn_params, model.enn_network_state, model.opt_state)
+        
+        def model_apply(x,
+                        index,):
+            net_out, state = model.enn.apply(model.enn_params, model.enn_network_state, x, index)
+            net_out = networks.parse_net_output(net_out)
+            mean = net_out[:,:20]
+            logvar = net_out[:,20:]
+            return mean, logvar
+
+        model.enn_apply = model_apply
+        
+        class LogLoss(losses_base.SingleLossFnArray):
+            def __call__(self,
+                            params: hk.Params,
+                            state: hk.State,
+                            x,
+                            y,
+                            index, ):
+                    net_out, state = model.enn.apply(params, state, x, index)
+                    net_out = networks.parse_net_output(net_out)
+                    mean = net_out[:,:20]
+                    logvar = net_out[:,20:]
+                    inv_var = jnp.exp(-logvar)      
+                    train_losses = ((mean - y) ** 2) * inv_var + logvar
+                    return jnp.mean(train_losses), net_out
+                
+        model.enn_loss_fn = LogLoss()
 
         return model
 

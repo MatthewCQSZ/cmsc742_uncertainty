@@ -9,11 +9,21 @@ import torch
 from torch import nn as nn
 from torch.nn import functional as F
 
-from config.utils import swish, get_affine_params
 from DotmapUtils import get_required_argument
+from config.utils import swish, get_affine_params, TrainingState
+
+from enn.losses import base as losses_base
+from enn import networks
+import optax
+import haiku as hk
+import jax
+import jax.numpy as jnp
 
 
 TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+assert len(jax.devices("gpu")) > 0
+gpu = jax.devices("gpu")[0]
 
 
 class PtModel(nn.Module):
@@ -92,7 +102,7 @@ class ReacherConfigModule:
     NTRAIN_ITERS = 50
     NROLLOUTS_PER_ITER = 1
     PLAN_HOR = 25
-    MODEL_IN, MODEL_OUT = 24, 17
+    MODEL_IN, MODEL_OUT = 25, 17
     GP_NINDUCING_POINTS = 200
 
     def __init__(self):
@@ -113,6 +123,20 @@ class ReacherConfigModule:
         self.UPDATE_FNS = [self.update_goal]
 
         self.goal = None
+        
+    @staticmethod
+    def obs_preproc(obs):
+        if isinstance(obs, np.ndarray):
+           return np.concatenate([np.sin(obs[:, 1:2]), np.cos(obs[:, 1:2]), obs[:, :1], obs[:, 2:]], axis=1)
+        elif isinstance(obs, torch.Tensor):
+            return torch.cat([
+                obs[:, 1:2].sin(),
+                obs[:, 1:2].cos(),
+                obs[:, :1],
+                obs[:, 2:]
+            ], dim=1)
+        else:
+            return jnp.concatenate([jnp.sin(obs[:, 1:2]), jnp.cos(obs[:, 1:2]), obs[:, :1], obs[:, 2:]], axis=1)
 
     @staticmethod
     def obs_postproc(obs, pred):
@@ -126,22 +150,31 @@ class ReacherConfigModule:
         self.goal = self.ENV.goal
 
     def obs_cost_fn(self, obs):
-
-        assert isinstance(obs, torch.Tensor)
         assert self.goal is not None
+        if isinstance(obs, torch.Tensor):
+            obs = obs.detach().cpu().numpy()
 
-        obs = obs.detach().cpu().numpy()
+            ee_pos = ReacherConfigModule.get_ee_pos(obs)
+            dis = ee_pos - self.goal
 
-        ee_pos = ReacherConfigModule.get_ee_pos(obs)
-        dis = ee_pos - self.goal
+            cost = np.sum(np.square(dis), axis=1)
 
-        cost = np.sum(np.square(dis), axis=1)
+            return torch.from_numpy(cost).float().to(TORCH_DEVICE)
+        else:
 
-        return torch.from_numpy(cost).float().to(TORCH_DEVICE)
+            ee_pos = ReacherConfigModule.get_ee_pos_jax(obs)
+            dis = ee_pos - self.goal
+
+            cost = jnp.sum(jnp.square(dis), axis=1)
+
+            return cost
 
     @staticmethod
     def ac_cost_fn(acs):
-        return 0.01 * (acs ** 2).sum(dim=1)
+        if isinstance(acs, torch.Tensor):
+            return 0.01 * (acs ** 2).sum(dim=1)
+        else:
+            return 0.01 * jnp.sum((acs ** 2), axis=1)
 
     def nn_constructor(self, model_init_cfg):
         ensemble_size = get_required_argument(model_init_cfg, "num_nets", "Must provide ensemble size")
@@ -155,6 +188,53 @@ class ReacherConfigModule:
         # * 2 because we output both the mean and the variance
 
         model.optim = torch.optim.Adam(model.parameters(), lr=0.001)
+        
+        # TODO: flexible parameters
+        seed = 0
+        model.rng = hk.PRNGSequence(seed)
+        
+        model.enn = networks.MLPEnsembleMatchedPrior(
+            output_sizes=[50, 50, self.MODEL_OUT * 2],
+            dummy_input = np.zeros((32, self.MODEL_IN)),
+            num_ensemble=ensemble_size,
+        )
+        
+        index = model.enn.indexer(next(model.rng))
+        model.enn_params, model.enn_network_state = model.enn.init(next(model.rng), np.zeros((32, self.MODEL_IN)), index) #rng, inputs, index
+        
+        
+        
+        # Optimizer
+        model.enn_optimizer = optax.adam(1e-3)
+        model.opt_state = model.enn_optimizer.init(model.enn_params)
+        model.enn_state = TrainingState(model.enn_params, model.enn_network_state, model.opt_state)
+        
+        def model_apply(x,
+                        index,):
+            net_out, state = model.enn.apply(model.enn_params, model.enn_network_state, x, index)
+            net_out = networks.parse_net_output(net_out)
+            mean = net_out[:,:17]
+            logvar = net_out[:,17:]
+            return mean, logvar
+
+        model.enn_apply = model_apply
+        
+        class LogLoss(losses_base.SingleLossFnArray):
+            def __call__(self,
+                            params: hk.Params,
+                            state: hk.State,
+                            x,
+                            y,
+                            index, ):
+                    net_out, state = model.enn.apply(params, state, x, index)
+                    net_out = networks.parse_net_output(net_out)
+                    mean = net_out[:,:17]
+                    logvar = net_out[:,17:]
+                    inv_var = jnp.exp(-logvar)      
+                    train_losses = ((mean - y) ** 2) * inv_var + logvar
+                    return jnp.mean(train_losses), net_out
+                
+        model.enn_loss_fn = LogLoss()
 
         return model
 
@@ -184,6 +264,36 @@ class ReacherConfigModule:
             new_rot_perp_axis[np.linalg.norm(new_rot_perp_axis, axis=1) < 1e-30] = \
                 rot_perp_axis[np.linalg.norm(new_rot_perp_axis, axis=1) < 1e-30]
             new_rot_perp_axis /= np.linalg.norm(new_rot_perp_axis, axis=1, keepdims=True)
+            rot_axis, rot_perp_axis, cur_end = new_rot_axis, new_rot_perp_axis, cur_end + length * new_rot_axis
+
+        return cur_end
+    
+    @staticmethod
+    def get_ee_pos_jax(states):
+
+        theta1, theta2, theta3, theta4, theta5, theta6, theta7 = \
+            states[:, :1], states[:, 1:2], states[:, 2:3], states[:, 3:4], states[:, 4:5], states[:, 5:6], states[:, 6:]
+
+        rot_axis = jnp.concatenate([jnp.cos(theta2) * jnp.cos(theta1), jnp.cos(theta2) * jnp.sin(theta1), -jnp.sin(theta2)],
+                                  axis=1)
+
+        rot_perp_axis = jnp.concatenate([-jnp.sin(theta1), jnp.cos(theta1), jnp.zeros(theta1.shape)], axis=1)
+        cur_end = jnp.concatenate([
+            0.1 * jnp.cos(theta1) + 0.4 * jnp.cos(theta1) * jnp.cos(theta2),
+            0.1 * jnp.sin(theta1) + 0.4 * jnp.sin(theta1) * jnp.cos(theta2) - 0.188,
+            -0.4 * jnp.sin(theta2)
+        ], axis=1)
+
+        for length, hinge, roll in [(0.321, theta4, theta3), (0.16828, theta6, theta5)]:
+            perp_all_axis = jnp.cross(rot_axis, rot_perp_axis)
+            x = jnp.cos(hinge) * rot_axis
+            y = jnp.sin(hinge) * jnp.sin(roll) * rot_perp_axis
+            z = -jnp.sin(hinge) * jnp.cos(roll) * perp_all_axis
+            new_rot_axis = x + y + z
+            new_rot_perp_axis = jnp.cross(new_rot_axis, rot_axis)
+            #new_rot_perp_axis[jnp.where(jnp.linalg.norm(new_rot_perp_axis, axis=1) < 1e-30, 1, 0)] = \
+            #    rot_perp_axis[jnp.where(jnp.linalg.norm(new_rot_perp_axis, axis=1) < 1e-30, 1, 0)]
+            new_rot_perp_axis /= jnp.linalg.norm(new_rot_perp_axis, axis=1, keepdims=True)
             rot_axis, rot_perp_axis, cur_end = new_rot_axis, new_rot_perp_axis, cur_end + length * new_rot_axis
 
         return cur_end

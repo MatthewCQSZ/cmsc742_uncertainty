@@ -120,11 +120,10 @@ def _create_ctrl_config(ctrl_cfg, cfg_module, ctrl_type, ctrl_args, type_map):
     # Finish setting model class
 
     #set whether epinet will be used
-    model_init_cfg.epinet = True
-
+    ctrl_cfg.opt_cfg.epinet = ctrl_args.epinet
 
     #Set opt_cfg epistemic reward coef
-    ctrl_cfg.opt_cfg.epi_coef = 0
+    ctrl_cfg.opt_cfg.epi_coef = ctrl_args.epi_coef
 
 
     # Setting MPC cfg
