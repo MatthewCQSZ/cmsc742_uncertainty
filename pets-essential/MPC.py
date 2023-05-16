@@ -254,12 +254,20 @@ class MPC(Controller):
 
                 mean, logvar = self.model(train_in, ret_logvar=True)
                 print(mean.shape)
-                print(logvar.shape)
+                train_in = train_in[0]
+                train_in = train_in.detach().cpu().numpy()
+                print("train in shape")
                 print(train_in.shape)
+                train_in = np.hstack((train_in, np.ones((len(train_in), 1))))
+                print(train_in.shape)
+                print("params below")
+                print(self.model.enn_params['mlp/~/linear_0']['w'].shape)
+
+
                 
                 enn_out = self.model.enn.apply(self.model.enn_params, 
                                                self.model.enn_state, 
-                                               train_in.cpu().detach().numpy(), 
+                                               train_in, 
                                                next(self.model.rng)) # params, state, inputs, index
                 print(enn_out.shape)
                 

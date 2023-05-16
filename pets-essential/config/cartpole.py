@@ -179,12 +179,15 @@ class CartpoleConfigModule:
         # TODO: flexible parameters
         seed = 0
         model.rng = hk.PRNGSequence(seed)
+
+        print(type(self.MODEL_IN))
+        print("Model in above")
         
         # ENN, default everything
         model.enn = networks.MLPEnsembleMatchedPrior(
-            output_sizes=[self.MODEL_OUT * 2],
-            dummy_input = np.zeros(self.MODEL_IN),
-            num_ensemble=10,
+            output_sizes=[50, 50, self.MODEL_OUT * 2],
+            dummy_input = np.zeros((32, self.MODEL_IN + 1)),
+            num_ensemble=ensemble_size,
         )
         
         index = model.enn.indexer(next(model.rng))
