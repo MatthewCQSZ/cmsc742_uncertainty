@@ -11,6 +11,7 @@ from DotmapUtils import get_required_argument
 from optimizers import CEMOptimizer
 
 from tqdm import trange
+from functools import partial
 
 import torch
 
@@ -21,7 +22,8 @@ import jax.numpy as jnp
 
 from config.utils import TrainingState
 
-TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+#TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+TORCH_DEVICE = torch.device('cpu') if torch.cuda.is_available() else torch.device('cpu')
 
 print(f"Running on TORCH_DEVICE:{TORCH_DEVICE}")
 
@@ -128,7 +130,7 @@ class MPC(Controller):
         self.update_fns = params.get("update_fns", [])
         self.per = params.get("per", 1)
 
-        self.model_init_cig = params.prop_cfg.get("model_init_cfg", {})
+        self.model_init_cfg = params.prop_cfg.get("model_init_cfg", {})
         self.model_train_cfg = params.prop_cfg.get("model_train_cfg", {})
         self.prop_mode = get_required_argument(params.prop_cfg, "mode", "Must provide propagation method.")
         self.npart = get_required_argument(params.prop_cfg, "npart", "Must provide number of particles.")
@@ -153,10 +155,14 @@ class MPC(Controller):
         self.epistemic_aux = self.epistemic_coef > 0
         print("Epistemic Aux", self.epistemic_aux)
 
+        #bool for whether epinet
+        self.epinet = self.model_init_cfg.epinet
+        print("Epinet", self.epinet)
+
         # Perform argument checks
         assert self.opt_mode == 'CEM'
         assert self.prop_mode == 'TSinf', 'only TSinf propagation mode is supported'
-        assert self.npart % self.model_init_cig.num_nets == 0, "Number of particles must be a multiple of the ensemble size."
+        assert self.npart % self.model_init_cfg.num_nets == 0, "Number of particles must be a multiple of the ensemble size."
 
         # Create action sequence optimizer
         opt_cfg = params.opt_cfg.get("cfg", {})
@@ -200,6 +206,10 @@ class MPC(Controller):
         else:
             print("Trajectory prediction logging is disabled.")
 
+        #make sure jax has gpu
+        assert len(jax.devices("gpu")) > 0
+        self.gpu = jax.devices("gpu")[0]
+
         # Set up pytorch model
         self.model = get_required_argument(
             params.prop_cfg.model_init_cfg, "model_constructor", "Must provide a model constructor."
@@ -230,6 +240,7 @@ class MPC(Controller):
         # Train the model
         self.has_been_trained = True
 
+
         # Train the pytorch model
         self.model.fit_input_stats(self.train_in)
 
@@ -252,65 +263,65 @@ class MPC(Controller):
                 loss += self.model.compute_decays()
 
                 # TODO: move all training data to GPU before hand
-                train_in = torch.from_numpy(self.train_in[batch_idxs]).to(TORCH_DEVICE).float()
-                train_targ = torch.from_numpy(self.train_targs[batch_idxs]).to(TORCH_DEVICE).float()
+                if self.epinet:
+                    train_in = jax.device_put(self.train_in[batch_idxs], self.gpu)[0]
+                    train_targ = jax.device_put(self.train_targs[batch_idxs], self.gpu)[0]
+                    index = self.model.enn.indexer(next(self.model.rng))
 
-                mean, logvar = self.model(train_in, ret_logvar=True)
-                train_in = train_in[0]
-                train_in = train_in.detach().cpu().numpy()
-                train_targ_0 = train_targ[0].detach().cpu().numpy()
+                    grads = jax.grad(self.model.enn_loss_fn)(self.model.enn_state.params, 
+                                                            self.model.enn_state.network_state, 
+                                                            train_in,
+                                                            train_targ, 
+                                                            index)
+                    updates, new_opt_state = self.model.enn_optimizer.update(grads, self.model.enn_state.opt_state)
+                    new_params = optax.apply_updates(self.model.enn_state.params, updates)
+                    new_state = TrainingState(
+                            params=new_params,
+                            network_state=self.model.enn_state.network_state,
+                            opt_state=new_opt_state,
+                        )
+                    
+                    self.model.enn_state = new_state
+                    #train_in = train_in.detach().cpu().numpy()
+                    #train_targ_0 = train_targ[0].detach().cpu().numpy()
 
-                index = self.model.enn.indexer(next(self.model.rng))
-                #enn_out, network_state = self.model.enn.apply(self.model.enn_state.params, 
-                #                               self.model.enn_state.network_state, 
-                #                               train_in, 
-                #                               index) # params, state, inputs, index
-                
-                # Update ENN
-                grads = jax.grad(self.model.enn_loss_fn)(self.model.enn_state.params, 
-                                                         self.model.enn_state.network_state, 
-                                                         train_in,
-                                                         train_targ_0, 
-                                                         index)
-                updates, new_opt_state = self.model.enn_optimizer.update(grads, self.model.enn_state.opt_state)
-                new_params = optax.apply_updates(self.model.enn_state.params, updates)
-                new_state = TrainingState(
-                        params=new_params,
-                        network_state=self.model.enn_state.network_state,
-                        opt_state=new_opt_state,
-                    )
-                
-                self.model.enn_state = new_state
-                
-                # TODO: add ENN output to base network output
-                
-                inv_var = torch.exp(-logvar)
-                
-                train_losses = ((mean - train_targ) ** 2) * inv_var + logvar
-                train_losses = train_losses.mean(-1).mean(-1).sum()
-                # Only taking mean over the last 2 dimensions
-                # The first dimension corresponds to each model in the ensemble
+                    #enn_out, network_state = self.model.enn.apply(self.model.enn_state.params, 
+                    #                               self.model.enn_state.network_state, 
+                    #                               train_in, 
+                    #                               index) # params, state, inputs, index
+                    
+                    # Update ENN
+                    
+                    # TODO: add ENN output to base network output
+                else:
+                    train_in = torch.from_numpy(self.train_in[batch_idxs]).to(TORCH_DEVICE).float()
+                    train_targ = torch.from_numpy(self.train_targs[batch_idxs]).to(TORCH_DEVICE).float()
+                    mean, logvar = self.model(train_in, ret_logvar=True)
 
-                loss += train_losses
+                    inv_var = torch.exp(-logvar)
+                    
+                    train_losses = ((mean - train_targ) ** 2) * inv_var + logvar
+                    train_losses = train_losses.mean(-1).mean(-1).sum()
+                    # Only taking mean over the last 2 dimensions
+                    # The first dimension corresponds to each model in the ensemble
 
-                self.model.optim.zero_grad()
-                loss.backward()
-                self.model.optim.step()
-                
-                
-                exit()
+                    loss += train_losses
 
+                    self.model.optim.zero_grad()
+                    loss.backward()
+                    self.model.optim.step()
+                
             idxs = shuffle_rows(idxs)
 
-            val_in = torch.from_numpy(self.train_in[idxs[:5000]]).to(TORCH_DEVICE).float()
-            val_targ = torch.from_numpy(self.train_targs[idxs[:5000]]).to(TORCH_DEVICE).float()
+            #val_in = torch.from_numpy(self.train_in[idxs[:5000]]).to(TORCH_DEVICE).float()
+            #val_targ = torch.from_numpy(self.train_targs[idxs[:5000]]).to(TORCH_DEVICE).float()
 
-            mean, _ = self.model(val_in)
-            mse_losses = ((mean - val_targ) ** 2).mean(-1).mean(-1)
+            #mean, _ = self.model(val_in)
+            #mse_losses = ((mean - val_targ) ** 2).mean(-1).mean(-1)
 
-            epoch_range.set_postfix({
-                "Training loss(es)": mse_losses.detach().cpu().numpy()
-            })
+            #epoch_range.set_postfix({
+            #    "Training loss(es)": mse_losses.detach().cpu().numpy()
+            #})
 
     def reset(self):
         """Resets this controller (clears previous solution, calls all update functions).
@@ -400,41 +411,62 @@ class MPC(Controller):
     
 
 
-    @torch.no_grad()
-    def _compile_cost(self, ac_seqs, epi_rew = False):
+    #@torch.no_grad()
+    @partial(jax.jit, static_argnums=(0, 4))
+    def _compile_cost(self, ac_seqs, rng1, rng2, epi_rew = False):
 
         nopt = ac_seqs.shape[0]
 
-        ac_seqs = torch.from_numpy(ac_seqs).float().to(TORCH_DEVICE)
-
-        # Reshape ac_seqs so that it's amenable to parallel compute
-        # Before, ac seqs has dimension (400, 25) which are pop size and sol dim coming from CEM
-        ac_seqs = ac_seqs.view(-1, self.plan_hor, self.dU)
-        #  After, ac seqs has dimension (400, 25, 1)
-
-        transposed = ac_seqs.transpose(0, 1)
-        # Then, (25, 400, 1)
-
-        expanded = transposed[:, :, None]
-        # Then, (25, 400, 1, 1)
-
-        tiled = expanded.expand(-1, -1, self.npart, -1)
-        # Then, (25, 400, 20, 1)
-
-        ac_seqs = tiled.contiguous().view(self.plan_hor, -1, self.dU)
-        # Then, (25, 8000, 1)
 
         # Expand current observation
-        cur_obs = torch.from_numpy(self.sy_cur_obs).float().to(TORCH_DEVICE)
-        cur_obs = cur_obs[None]
-        cur_obs = cur_obs.expand(nopt * self.npart, -1)
+        if self.epinet:
+            ac_seqs = jax.device_put(jnp.array(ac_seqs), self.gpu)
+            ac_seqs = jax.lax.stop_gradient(ac_seqs) 
+            ac_seqs = jnp.reshape(ac_seqs, (-1, self.plan_hor, self.dU))
+            transposed = jnp.transpose(ac_seqs, (1, 0, 2))
+            expanded = transposed[:, :, None]
+            tiled = jnp.repeat(expanded, self.npart, 2)
+            ac_seqs = jnp.reshape(tiled, (self.plan_hor, -1, self.dU))
 
-        costs = torch.zeros(nopt, self.npart, device=TORCH_DEVICE)
+            cur_obs = jnp.array(self.sy_cur_obs)
+            cur_obs = jax.lax.stop_gradient(cur_obs) 
+            cur_obs = jax.device_put(cur_obs, self.gpu)
+            cur_obs = cur_obs[None]
+            cur_obs = jnp.repeat(cur_obs, nopt * self.npart, axis=0)
+
+            costs = jax.device_put(jnp.zeros((nopt, self.npart)), self.gpu)
+            costs = jax.lax.stop_gradient(costs)
+        else:
+            ac_seqs = torch.from_numpy(ac_seqs).float().to(TORCH_DEVICE)
+
+            # Reshape ac_seqs so that it's amenable to parallel compute
+            # Before, ac seqs has dimension (400, 25) which are pop size and sol dim coming from CEM
+            ac_seqs = ac_seqs.view(-1, self.plan_hor, self.dU)
+            #  After, ac seqs has dimension (400, 25, 1)
+
+            transposed = ac_seqs.transpose(0, 1)
+            # Then, (25, 400, 1)
+
+            expanded = transposed[:, :, None]
+            # Then, (25, 400, 1, 1)
+
+            tiled = expanded.expand(-1, -1, self.npart, -1)
+            # Then, (25, 400, 20, 1)
+
+            ac_seqs = tiled.contiguous().view(self.plan_hor, -1, self.dU)
+            # Then, (25, 8000, 1)
+            cur_obs = torch.from_numpy(self.sy_cur_obs).float().to(TORCH_DEVICE)
+            cur_obs = cur_obs[None]
+            cur_obs = cur_obs.expand(nopt * self.npart, -1)
+
+            costs = torch.zeros(nopt, self.npart, device=TORCH_DEVICE)
 
         for t in range(self.plan_hor):
             cur_acs = ac_seqs[t]
-
-            next_obs, inputs = self._predict_next_obs(cur_obs, cur_acs)
+            if self.epinet:
+                next_obs, inputs = self._predict_next_obs_epinet(cur_obs, cur_acs, rng1, rng2)
+            else:
+                next_obs, inputs = self._predict_next_obs_vanilla(cur_obs, cur_acs)
 
             cost = self.obs_cost_fn(next_obs) + self.ac_cost_fn(cur_acs)
 
@@ -442,27 +474,34 @@ class MPC(Controller):
                 cost -= self.epistemic_coef * self.get_epistemic_info_rad(inputs)
 
 
-            cost = cost.view(-1, self.npart)
+            if self.epinet:
+                cost = cost.reshape(-1, self.npart)
+            else:
+                cost = cost.view(-1, self.npart)
 
             costs += cost
             cur_obs = self.obs_postproc2(next_obs)
 
         # Replace nan with high cost
-        costs[costs != costs] = 1e6
-        retVal = costs.mean(dim=1).detach().cpu().numpy()
+        if self.epinet:
+            costs = jnp.nan_to_num(costs, copy=False, nan=1e6)
+            retVal = jnp.mean(costs, axis=1)
+        else:
+            costs[costs != costs] = 1e6
+            retVal = costs.mean(dim=1).detach().cpu()
         #print("Cost Stats")
         #print(np.mean(retVal), np.var(retVal))
         return retVal
 
     @torch.no_grad()
     def _compile_cost_eval(self, ac_seqs):
-        return self._compile_cost(ac_seqs, epi_rew=False)
+        return np.array(self._compile_cost(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=False))
 
     @torch.no_grad()
     def _compile_cost_train(self, ac_seqs):
-        return self._compile_cost(ac_seqs, epi_rew=True)
+        return np.array(self._compile_cost(ac_seqs, next(self.model.rng), next(self.model.rng), epi_rew=True))
 
-    def _predict_next_obs(self, obs, acs):
+    def _predict_next_obs_vanilla(self, obs, acs):
         proc_obs = self.obs_preproc(obs)
 
         assert self.prop_mode == 'TSinf'
@@ -481,28 +520,68 @@ class MPC(Controller):
 
         return self.obs_postproc(obs, predictions), inputs
 
+    def _predict_next_obs_epinet(self, obs, acs, rng1, rng2):
+        proc_obs = self.obs_preproc(obs)
+
+        assert self.prop_mode == 'TSinf'
+
+        proc_obs = self._expand_to_ts_format(proc_obs)
+        acs = self._expand_to_ts_format(acs)
+
+        inputs = jnp.concatenate((proc_obs, acs), axis=-1)[0]
+
+        index = self.model.enn.indexer(rng1)
+
+        enn_out, network_state = self.model.enn.apply(self.model.enn_state.params, 
+                                      self.model.enn_state.network_state, 
+                                      inputs, 
+                                      index) # params, state, inputs, index
+
+
+        enn_out = enn_out.train + enn_out.prior
+        model_out = enn_out.shape[-1]
+        mean = enn_out[..., :model_out//2]
+        var = enn_out[..., model_out//2:]
+        predictions = mean + jax.random.normal(rng2, var.shape) * jnp.sqrt(var)
+
+        # TS Optimization: Remove additional dimension
+        predictions = self._flatten_to_matrix(predictions)
+
+        return self.obs_postproc(obs, predictions), inputs
+
     def _expand_to_ts_format(self, mat):
         dim = mat.shape[-1]
 
         # Before, [10, 5] in case of proc_obs
-        reshaped = mat.view(-1, self.model.num_nets, self.npart // self.model.num_nets, dim)
-        # After, [2, 5, 1, 5]
-
-        transposed = reshaped.transpose(0, 1)
-        # After, [5, 2, 1, 5]
-
-        reshaped = transposed.contiguous().view(self.model.num_nets, -1, dim)
-        # After. [5, 2, 5]
+        if self.epinet:
+            reshaped = mat.reshape(-1, self.model.num_nets, self.npart // self.model.num_nets, dim)
+            transposed = jnp.transpose(reshaped, axes=(1, 0, 2, 3))
+            reshaped = mat.reshape(self.model.num_nets, -1, dim)
+        else:
+            reshaped = mat.view(-1, self.model.num_nets, self.npart // self.model.num_nets, dim)
+            # After, [2, 5, 1, 5]
+            transposed = reshaped.transpose(0, 1)
+            # After, [5, 2, 1, 5]
+            reshaped = transposed.contiguous().view(self.model.num_nets, -1, dim)
+            # After. [5, 2, 5]
 
         return reshaped
 
     def _flatten_to_matrix(self, ts_fmt_arr):
-        dim = ts_fmt_arr.shape[-1]
 
-        reshaped = ts_fmt_arr.view(self.model.num_nets, -1, self.npart // self.model.num_nets, dim)
+        if self.epinet:
+            dim = ts_fmt_arr.shape[-1]
+            reshaped = ts_fmt_arr.reshape(self.model.num_nets, -1, self.npart // self.model.num_nets, dim)
+            transposed = jnp.transpose(reshaped, (1, 0, 2, 3))
+            reshaped = transposed.reshape(-1, dim)
 
-        transposed = reshaped.transpose(0, 1)
+        else:
+            dim = ts_fmt_arr.shape[-1]
 
-        reshaped = transposed.contiguous().view(-1, dim)
+            reshaped = ts_fmt_arr.view(self.model.num_nets, -1, self.npart // self.model.num_nets, dim)
+
+            transposed = reshaped.transpose(0, 1)
+
+            reshaped = transposed.contiguous().view(-1, dim)
 
         return reshaped

@@ -18,8 +18,13 @@ import haiku as hk
 import jax
 import chex
 import jax.numpy as jnp
+from jaxlib.xla_extension import ArrayImpl
 
-TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+TORCH_DEVICE = torch.device('cpu') if torch.cuda.is_available() else torch.device('cpu')
+
+#get gpu device for jax allocation
+assert len(jax.devices("gpu")) > 0
+gpu = jax.devices("gpu")[0]
 
 
 class PtModel(nn.Module):
@@ -104,6 +109,7 @@ class CartpoleConfigModule:
     # Create and move this tensor to GPU so that
     # we do not waste time moving it repeatedly to GPU later
     ee_sub = torch.tensor([0.0, 0.6], device=TORCH_DEVICE, dtype=torch.float)
+    ee_sub_jnp = jax.device_put(jnp.array([0.0, 0.6]), gpu)
 
     def __init__(self):
         self.ENV = gym.make(self.ENV_NAME)
@@ -131,6 +137,8 @@ class CartpoleConfigModule:
                 obs[:, :1],
                 obs[:, 2:]
             ], dim=1)
+        else:
+            return jnp.concatenate([jnp.sin(obs[:, 1:2]), jnp.cos(obs[:, 1:2]), obs[:, :1], obs[:, 2:]], axis=1)
 
     @staticmethod
     def obs_postproc(obs, pred):
@@ -144,25 +152,34 @@ class CartpoleConfigModule:
     def obs_cost_fn(obs):
         ee_pos = CartpoleConfigModule._get_ee_pos(obs)
 
-        ee_pos -= CartpoleConfigModule.ee_sub
-
-        ee_pos = ee_pos ** 2
-
-        ee_pos = - ee_pos.sum(dim=1)
-
-        return - (ee_pos / (0.6 ** 2)).exp()
+        if isinstance(obs, torch.Tensor):
+            ee_pos -= CartpoleConfigModule.ee_sub
+            ee_pos = ee_pos ** 2
+            ee_pos = - ee_pos.sum(dim=1)
+            return - (ee_pos / (0.6 ** 2)).exp()
+        else:
+            ee_pos -= CartpoleConfigModule.ee_sub_jnp
+            ee_pos = ee_pos ** 2
+            ee_pos = -jnp.sum(ee_pos, axis=1)
+            return - jnp.exp(ee_pos / (0.6 ** 2))
 
     @staticmethod
     def ac_cost_fn(acs):
-        return 0.01 * (acs ** 2).sum(dim=1)
+        if isinstance(acs, torch.Tensor):
+            return 0.01 * (acs ** 2).sum(dim=1)
+        else:
+            return 0.01 * jnp.sum((acs ** 2), axis=1)
 
     @staticmethod
     def _get_ee_pos(obs):
         x0, theta = obs[:, :1], obs[:, 1:2]
 
-        return torch.cat([
-            x0 - 0.6 * theta.sin(), -0.6 * theta.cos()
-        ], dim=1)
+        if isinstance(x0, torch.Tensor):
+            return torch.cat([
+                x0 - 0.6 * theta.sin(), -0.6 * theta.cos()
+            ], dim=1)
+        else:
+            return jnp.concatenate([x0 - 0.6 * jnp.sin(theta), -0.6 * jnp.cos(theta)], axis=1)
 
     def nn_constructor(self, model_init_cfg):
 
