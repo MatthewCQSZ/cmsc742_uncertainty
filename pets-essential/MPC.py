@@ -17,6 +17,9 @@ import torch
 import optax
 import haiku as hk
 import jax
+import jax.numpy as jnp
+
+from config.utils import TrainingState
 
 TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -253,21 +256,34 @@ class MPC(Controller):
                 train_targ = torch.from_numpy(self.train_targs[batch_idxs]).to(TORCH_DEVICE).float()
 
                 mean, logvar = self.model(train_in, ret_logvar=True)
-                print(mean.shape)
-                print(logvar.shape)
-                print(train_in.shape)
+                train_in = train_in[0]
+                train_in = train_in.detach().cpu().numpy()
+                train_targ_0 = train_targ[0].detach().cpu().numpy()
+
+                index = self.model.enn.indexer(next(self.model.rng))
+                #enn_out, network_state = self.model.enn.apply(self.model.enn_state.params, 
+                #                               self.model.enn_state.network_state, 
+                #                               train_in, 
+                #                               index) # params, state, inputs, index
                 
-                enn_out = self.model.enn.apply(self.model.enn_params, 
-                                               self.model.enn_state, 
-                                               train_in.cpu().detach().numpy(), 
-                                               next(self.model.rng)) # params, state, inputs, index
-                print(enn_out.shape)
+                # Update ENN
+                grads = jax.grad(self.model.enn_loss_fn)(self.model.enn_state.params, 
+                                                         self.model.enn_state.network_state, 
+                                                         train_in,
+                                                         train_targ_0, 
+                                                         index)
+                updates, new_opt_state = self.model.enn_optimizer.update(grads, self.model.enn_state.opt_state)
+                new_params = optax.apply_updates(self.model.enn_state.params, updates)
+                new_state = TrainingState(
+                        params=new_params,
+                        network_state=self.model.enn_state.network_state,
+                        opt_state=new_opt_state,
+                    )
                 
-                # TODO: match inputs size to ENN
-                # ValueError: 'mlp/~/linear_0/w' with retrieved shape (2, 6, 8) does not match shape=[192, 8] dtype=dtype('float32')
+                self.model.enn_state = new_state
                 
                 # TODO: add ENN output to base network output
-                exit()
+                
                 inv_var = torch.exp(-logvar)
                 
                 train_losses = ((mean - train_targ) ** 2) * inv_var + logvar
@@ -282,13 +298,7 @@ class MPC(Controller):
                 self.model.optim.step()
                 
                 
-                # Update ENN
-                loss_output, grads = jax.value_and_grad(self._loss, has_aux=True)(
-                self.model.enn_params, self.model.enn_state, train_in.cpu().detach().numpy(), next(self.model.rng))
-                loss, ( self.model.enn_state, loss_metrics) = loss_output
-                loss_metrics.update({'loss': loss})
-                updates, new_opt_state = optimizer.update(grads, self.model.opt_state)
-                self.model.enn_params = optax.apply_updates(self.model.enn_params, updates)
+                exit()
 
             idxs = shuffle_rows(idxs)
 

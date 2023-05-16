@@ -48,6 +48,8 @@ class Agent:
         times, rewards = [], []
         O, A, reward_sum, done = [self.env.reset()], [], 0, False
 
+        pred_err = []
+
         policy.reset()
         for t in range(horizon):
             if video_record:
@@ -56,9 +58,18 @@ class Agent:
             A.append(policy.act(O[t], t, train = train))
             times.append(time.time() - start)
 
+
             obs, reward, done, info = self.env.step(A[t])
 
             O.append(obs)
+
+            #TODO: catastrophic forgetting experiment, preprocessing started below
+            #dont need this right now 
+            #pre_obs = O[-2]
+            #post_obs = O[-1]
+            #pre_action = A[-1]
+
+            #pred_obs = policy._predict_next_obs_()
             reward_sum += reward
             rewards.append(reward)
             if done:
