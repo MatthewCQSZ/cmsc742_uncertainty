@@ -3,7 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 from DotmapUtils import get_required_argument
-from config.utils import swish, get_affine_params
+from config.utils import swish, get_affine_params, TrainingState
 
 import gym
 import numpy as np
@@ -16,6 +16,7 @@ from enn import networks
 import optax
 import haiku as hk
 import jax
+import chex
 
 TORCH_DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -179,26 +180,33 @@ class CartpoleConfigModule:
         # TODO: flexible parameters
         seed = 0
         model.rng = hk.PRNGSequence(seed)
+
+        #print("Model in above")
         
         # ENN, default everything
+        #model.enn = networks.IndexMLPEnn(output_sizes=[50, 50, self.MODEL_OUT * 2], index_dim=1)
+        
         model.enn = networks.MLPEnsembleMatchedPrior(
-            output_sizes=[self.MODEL_OUT * 2],
-            dummy_input = np.zeros(self.MODEL_IN),
-            num_ensemble=10,
+            output_sizes=[50, 50, self.MODEL_OUT * 2],
+            dummy_input = np.zeros((32, self.MODEL_IN)),
+            num_ensemble=ensemble_size,
         )
         
         index = model.enn.indexer(next(model.rng))
-        model.enn_params, model.enn_state = model.enn.init(next(model.rng), np.zeros(self.MODEL_IN), index)
+        model.enn_params, model.enn_network_state = model.enn.init(next(model.rng), np.zeros((32, 6)), index) #rng, inputs, index
         
         # Loss
-        model.enn_loss_fn = losses.average_single_index_loss(
-            single_loss=losses.L2Loss(),
-            num_index_samples=10
-        )
-
+        model.enn_loss_fn = losses.L2Loss()
+        
+        #losses.average_single_index_loss(
+        #    single_loss=losses.L2Loss(),
+        #    num_index_samples=1
+        #)
+        
         # Optimizer
         model.enn_optimizer = optax.adam(1e-3)
         model.opt_state = model.enn_optimizer.init(model.enn_params)
+        model.enn_state = TrainingState(model.enn_params, model.enn_network_state, model.opt_state)
 
         return model
 

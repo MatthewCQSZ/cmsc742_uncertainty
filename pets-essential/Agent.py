@@ -63,11 +63,13 @@ class Agent:
 
             O.append(obs)
 
-            pre_obs = O[-2]
-            post_obs = O[-1]
-            pre_action = A[-1]
+            #TODO: catastrophic forgetting experiment, preprocessing started below
+            #dont need this right now 
+            #pre_obs = O[-2]
+            #post_obs = O[-1]
+            #pre_action = A[-1]
 
-            pred_obs = policy._predict_next_obs_()
+            #pred_obs = policy._predict_next_obs_()
             reward_sum += reward
             rewards.append(reward)
             if done:
