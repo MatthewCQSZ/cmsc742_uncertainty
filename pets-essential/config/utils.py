@@ -2,6 +2,10 @@ import numpy as np
 import tensorflow as tf
 import torch
 from torch import nn as nn
+import haiku as hk
+import optax
+import jax.numpy as jnp
+from typing import NamedTuple
 
 
 def swish(x):
@@ -35,3 +39,17 @@ def get_affine_params(ensemble_size, in_features, out_features):
     b = nn.Parameter(torch.zeros(ensemble_size, 1, out_features, dtype=torch.float32))
 
     return w, b
+
+
+def log_likelihood(x, x_hat):
+    """Gaussian log-likelihood."""
+    return -0.5 * jnp.sum((x - x_hat)**2) - 0.5 * x.shape[-1] * jnp.log(2 * jnp.pi)
+
+def kl_divergence(mu, logvar):
+    """KL divergence for a diagonal Gaussian distribution."""
+    return -0.5 * jnp.sum(1 + logvar - mu**2 - jnp.exp(logvar))
+
+class TrainingState(NamedTuple):
+  params: hk.Params
+  network_state: hk.State
+  opt_state: optax.OptState
